@@ -1,0 +1,23 @@
+kind = "mobile"
+previewPath = "/"
+title = "Mapa Espacial"
+version = "1.0.0"
+id = "artifacts/mapa-espacial"
+router = "expo-domain"
+
+[[services]]
+name = "expo"
+ensurePreviewReachable = "/status"
+paths = [ "/" ]
+localPort = 18498
+
+[services.development]
+run = "pnpm --filter @workspace/mapa-espacial run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/mapa-espacial", "run", "build" ]
+run = [ "pnpm", "--filter", "@workspace/mapa-espacial", "run", "serve" ]
+
+[services.env]
+PORT = "18498"
+BASE_PATH = "/"

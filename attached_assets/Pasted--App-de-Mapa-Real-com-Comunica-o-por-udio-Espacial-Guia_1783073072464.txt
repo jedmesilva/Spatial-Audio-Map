@@ -1,0 +1,425 @@
+# App de Mapa Real com Comunicação por Áudio Espacial
+
+Guia de arquitetura e sequência de implementação. Expo + EAS Build (dev client), MapLibre pro mapa, WebRTC + spatial audio nativo pra voz.
+
+---
+
+## 1. Visão geral do sistema
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      CLIENTE (Expo)                       │
+│                                                             │
+│  ┌──────────────┐  ┌──────────────┐  ┌─────────────────┐ │
+│  │   MapLibre    │  │  GPS/Heading │  │  Spatial Audio   │ │
+│  │  (mapa +      │  │  (expo-      │  │  Engine          │ │
+│  │   GeoJSON     │  │  location/   │  │  (Expo Module    │ │
+│  │   layers)     │  │  sensors)    │  │  ou Agora SDK)   │ │
+│  └──────┬───────┘  └──────┬───────┘  └────────┬────────┘ │
+│         │                  │                    │          │
+│         └──────────────────┴────────────────────┘          │
+│                            │                                │
+│                   Camada de Estado Local                    │
+│              (posição própria, posições próximas,           │
+│               itens visíveis, streams ativos)               │
+└────────────────────────────┬───────────────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              │                                 │
+      WebSocket (posição,                WebRTC (SFU)
+      itens, presença)                   (áudio de voz)
+              │                                 │
+┌─────────────┴─────────┐         ┌─────────────┴──────────┐
+│   Backend de Estado     │         │   SFU (mediasoup /      │
+│   - PostGIS/H3          │         │   LiveKit / Agora)      │
+│   - Query geoespacial   │         │   - subscribe/unsub     │
+│   - Lock de coleta      │         │     dinâmico por raio   │
+│   - Fonte da verdade    │         │                          │
+└──────────────────────────┘         └──────────────────────────┘
+```
+
+Duas conexões de rede separadas e independentes: **WebSocket** pra tudo que é estado (posição, itens, presença) e **WebRTC** só pro áudio. Isso importa porque a frequência de update é diferente (posição a cada 1-3s, áudio contínuo) e porque o SFU não deveria carregar lógica de jogo.
+
+---
+
+## 2. Decisão de caminho: Agora vs módulo nativo custom
+
+Antes de estruturar pastas, defina isso — muda a arquitetura da camada de áudio inteira.
+
+| | **Agora SDK (spatial audio)** | **Módulo nativo custom** |
+|---|---|---|
+| Tempo até MVP funcional | Dias | Semanas (2 implementações: iOS + Android) |
+| Controle sobre rolloff/distância | Configurável, mas dentro do que a API expõe | Total |
+| Custo | Por minuto de uso, escala com usuários | Infra própria (SFU self-hosted) |
+| Lock-in | Sim, no provider e pricing | Não |
+| Complexidade de manutenção | Baixa (SDK gerenciado) | Alta (2 codebases nativas) |
+
+**Recomendação pra validar o produto primeiro**: Agora. Migrar pra módulo custom depois é possível porque a camada de posicionamento (GPS → coordenadas relativas → raio de proximidade) é a mesma nos dois caminhos — só troca o que consome essas coordenadas. Este guia assume **Agora** como caminho principal, com nota de onde o módulo custom entraria no lugar.
+
+---
+
+## 3. Setup inicial do projeto
+
+```bash
+npx create-expo-app@latest meu-app-mapa
+cd meu-app-mapa
+npx expo install expo-dev-client
+npx expo install expo-location expo-sensors
+npx expo install @maplibre/maplibre-react-native
+npm install react-native-agora  # SDK de spatial audio
+```
+
+`app.json` — plugins necessários:
+
+```json
+{
+  "expo": {
+    "plugins": [
+      "expo-location",
+      [
+        "@maplibre/maplibre-react-native",
+        { "ios": { "requireLocationPermission": true } }
+      ],
+      [
+        "react-native-agora",
+        { "buildIphoneOSXcodeVersion": "" }
+      ]
+    ],
+    "ios": {
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Usamos sua localização pra mostrar itens e pessoas próximas no mapa.",
+        "NSLocationAlwaysAndWhenInUseUsageDescription": "Usamos sua localização em segundo plano pra manter sua posição atualizada no mapa.",
+        "UIBackgroundModes": ["location", "audio"]
+      }
+    },
+    "android": {
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_BACKGROUND_LOCATION",
+        "RECORD_AUDIO",
+        "MODIFY_AUDIO_SETTINGS"
+      ]
+    }
+  }
+}
+```
+
+```bash
+eas build --profile development --platform ios
+eas build --profile development --platform android
+```
+
+A partir daqui, instala o dev client no device e roda `npx expo start --dev-client` — hot reload normal, rebuild só quando adicionar módulo nativo novo.
+
+---
+
+## 4. Estrutura de pastas
+
+```
+src/
+├── screens/
+│   └── MapScreen.tsx
+├── map/
+│   ├── MapView.tsx              # wrapper do MapLibre
+│   ├── ItemsLayer.tsx           # GeoJSON source + symbol layer dos itens
+│   ├── PeopleLayer.tsx          # posições de outros usuários no mapa
+│   └── mapStyle.ts              # config do provider de tiles
+├── location/
+│   ├── useLocation.ts           # hook de GPS (expo-location)
+│   ├── useHeading.ts            # hook de bússola (expo-sensors)
+│   └── geo.ts                   # Haversine, conversão lat/lng → metros
+├── audio/
+│   ├── SpatialAudioEngine.ts    # wrapper do Agora spatial audio
+│   ├── useVoiceChannel.ts       # hook de entrada/saída de canal
+│   └── proximityConfig.ts       # refDistance, maxDistance, raio de corte
+├── realtime/
+│   ├── socket.ts                # conexão WebSocket
+│   ├── usePresence.ts           # sync de posição própria + recebimento de outros
+│   └── useNearbyItems.ts        # query geoespacial de itens próximos
+├── state/
+│   └── worldStore.ts            # zustand/jotai: posição própria, pessoas próximas, itens
+└── types/
+    └── geo.ts
+```
+
+---
+
+## 5. Camada de localização (base de tudo)
+
+```typescript
+// src/location/useLocation.ts
+import * as Location from 'expo-location';
+import { useEffect, useState } from 'react';
+
+export function useLocation() {
+  const [position, setPosition] = useState<{ lat: number; lng: number } | null>(null);
+
+  useEffect(() => {
+    let subscription: Location.LocationSubscription;
+
+    (async () => {
+      const { status } = await Location.requestForegroundPermissionsAsync();
+      if (status !== 'granted') return;
+
+      subscription = await Location.watchPositionAsync(
+        {
+          accuracy: Location.Accuracy.BestForNavigation,
+          timeInterval: 2000,
+          distanceInterval: 2,
+        },
+        (loc) => {
+          setPosition({ lat: loc.coords.latitude, lng: loc.coords.longitude });
+        }
+      );
+    })();
+
+    return () => subscription?.remove();
+  }, []);
+
+  return position;
+}
+```
+
+```typescript
+// src/location/geo.ts
+export function metersOffset(from: { lat: number; lng: number }, to: { lat: number; lng: number }) {
+  const dx = (to.lng - from.lng) * 111320 * Math.cos((from.lat * Math.PI) / 180);
+  const dy = (to.lat - from.lat) * 110540;
+  return { dx, dy };
+}
+
+export function distanceMeters(from: { lat: number; lng: number }, to: { lat: number; lng: number }) {
+  const { dx, dy } = metersOffset(from, to);
+  return Math.sqrt(dx * dx + dy * dy);
+}
+```
+
+Aplique um filtro de suavização (média móvel simples pra começar) antes de usar essa posição pra áudio — GPS puro vai fazer o panning "tremer".
+
+---
+
+## 6. Camada de mapa
+
+```typescript
+// src/map/MapView.tsx
+import MapLibreGL from '@maplibre/maplibre-react-native';
+import { ItemsLayer } from './ItemsLayer';
+import { PeopleLayer } from './PeopleLayer';
+
+MapLibreGL.setAccessToken(null); // não precisa de token pra estilos self-hosted/MapTiler
+
+export function AppMapView({ userPosition }: { userPosition: { lat: number; lng: number } }) {
+  return (
+    <MapLibreGL.MapView
+      style={{ flex: 1 }}
+      styleURL="https://api.maptiler.com/maps/streets-v2/style.json?key=SUA_KEY"
+    >
+      <MapLibreGL.Camera
+        centerCoordinate={[userPosition.lng, userPosition.lat]}
+        zoomLevel={16}
+        followUserLocation
+      />
+      <ItemsLayer userPosition={userPosition} />
+      <PeopleLayer userPosition={userPosition} />
+    </MapLibreGL.MapView>
+  );
+}
+```
+
+```typescript
+// src/map/ItemsLayer.tsx
+import MapLibreGL from '@maplibre/maplibre-react-native';
+import { useNearbyItems } from '../realtime/useNearbyItems';
+
+export function ItemsLayer({ userPosition }: { userPosition: { lat: number; lng: number } }) {
+  const items = useNearbyItems(userPosition); // já vem filtrado por raio do backend
+
+  const geojson = {
+    type: 'FeatureCollection' as const,
+    features: items.map((item) => ({
+      type: 'Feature' as const,
+      geometry: { type: 'Point' as const, coordinates: [item.lng, item.lat] },
+      properties: { id: item.id, tipo: item.tipo },
+    })),
+  };
+
+  return (
+    <MapLibreGL.ShapeSource id="items-source" shape={geojson}>
+      <MapLibreGL.SymbolLayer
+        id="items-layer"
+        style={{
+          iconImage: ['get', 'tipo'], // mapeado pra sprites carregados
+          iconSize: 0.8,
+          iconAllowOverlap: true,
+        }}
+      />
+    </MapLibreGL.ShapeSource>
+  );
+}
+```
+
+**Regra importante**: nunca renderize itens como `<MapLibreGL.PointAnnotation>` individual em quantidade — acima de ~50-100 itens simultâneos a performance cai. Sempre GeoJSON source + `setData` pra atualizar.
+
+Coleta de item — checagem client-side pra UX responsiva, confirmação server-side como fonte da verdade:
+
+```typescript
+// dentro de um loop/effect que roda a cada atualização de posição
+const proximos = items.filter((item) => distanceMeters(userPosition, item) < 15);
+if (proximos.length > 0) {
+  // habilita botão "Coletar" ou dispara coleta automática
+  // request pro backend: POST /items/:id/collect
+  // backend valida (lock otimista) e broadcasta remoção via WebSocket
+}
+```
+
+---
+
+## 7. Camada de áudio espacial
+
+```typescript
+// src/audio/proximityConfig.ts
+export const AUDIO_CONFIG = {
+  refDistance: 3,       // metros até volume máximo
+  maxDistance: 50,       // metros até silêncio
+  rolloffFactor: 1.5,
+  connectionRadius: 70,   // raio de subscribe/unsubscribe no SFU (buffer sobre maxDistance)
+};
+```
+
+```typescript
+// src/audio/SpatialAudioEngine.ts
+import { createAgoraRtcEngine, ChannelProfileType, ClientRoleType } from 'react-native-agora';
+import { AUDIO_CONFIG } from './proximityConfig';
+
+let engine: ReturnType<typeof createAgoraRtcEngine>;
+
+export function initSpatialAudio(appId: string) {
+  engine = createAgoraRtcEngine();
+  engine.initialize({ appId });
+  engine.setChannelProfile(ChannelProfileType.ChannelProfileLiveBroadcasting);
+  engine.setClientRole(ClientRoleType.ClientRoleBroadcaster);
+
+  // ativa o plugin de spatial audio
+  const spatialEngine = engine.getLocalSpatialAudioEngine();
+  spatialEngine.initialize();
+  spatialEngine.setMaxAudioRecvCount(30); // limite de streams simultâneas ouvidas
+  spatialEngine.setAudioRecvRange(AUDIO_CONFIG.maxDistance);
+  spatialEngine.setDistanceUnit(1); // 1 = metros
+
+  return spatialEngine;
+}
+
+export function joinVoiceChannel(channelName: string, uid: number, token: string) {
+  engine.joinChannel(token, channelName, uid, {});
+}
+
+export function updateSelfPosition(spatialEngine: any, dx: number, dy: number, heading: number) {
+  spatialEngine.updateSelfPosition({
+    position: [dx, dy, 0],
+    axisForward: [1, 0, 0],
+    axisRight: [0, 1, 0],
+    axisUp: [0, 0, 1],
+  });
+  spatialEngine.updateSelfRotation({ x: 0, y: 0, z: heading });
+}
+
+export function updateRemoteUserPosition(spatialEngine: any, uid: number, dx: number, dy: number) {
+  spatialEngine.updateRemotePosition(uid, {
+    position: [dx, dy, 0],
+    axisForward: [1, 0, 0],
+    axisRight: [0, 1, 0],
+    axisUp: [0, 0, 1],
+  });
+}
+```
+
+```typescript
+// src/audio/useVoiceChannel.ts
+import { useEffect, useRef } from 'react';
+import { metersOffset } from '../location/geo';
+import { updateSelfPosition, updateRemoteUserPosition } from './SpatialAudioEngine';
+import { AUDIO_CONFIG } from './proximityConfig';
+
+export function useVoiceChannel(userPosition: any, heading: number, nearbyPeople: any[], spatialEngine: any) {
+  useEffect(() => {
+    if (!userPosition || !spatialEngine) return;
+    updateSelfPosition(spatialEngine, 0, 0, heading);
+
+    nearbyPeople.forEach((person) => {
+      const { dx, dy } = metersOffset(userPosition, person);
+      const distance = Math.sqrt(dx * dx + dy * dy);
+
+      // subscribe/unsubscribe com buffer pra evitar flapping na borda
+      if (distance < AUDIO_CONFIG.connectionRadius && !person.subscribed) {
+        // engine.joinChannel / subscribe do stream do person
+        person.subscribed = true;
+      } else if (distance > AUDIO_CONFIG.connectionRadius && person.subscribed) {
+        // unsubscribe
+        person.subscribed = false;
+      }
+
+      if (person.subscribed) {
+        updateRemoteUserPosition(spatialEngine, person.uid, dx, dy);
+      }
+    });
+  }, [userPosition, heading, nearbyPeople]);
+}
+```
+
+**Se for pro caminho de módulo nativo custom em vez de Agora**: este arquivo (`SpatialAudioEngine.ts`) é o único que muda — a interface (`updateSelfPosition`, `updateRemoteUserPosition`, `joinVoiceChannel`) fica igual, só a implementação interna troca pra chamar seu Expo Module (`AVAudioEnvironmentNode` no iOS / Resonance no Android) em vez do Agora SDK. Todo o resto do app (mapa, GPS, lógica de proximidade) não muda.
+
+---
+
+## 8. Heading (orientação do listener)
+
+```typescript
+// src/location/useHeading.ts
+import { Magnetometer } from 'expo-sensors';
+import { useEffect, useState, useRef } from 'react';
+
+export function useHeading() {
+  const [heading, setHeading] = useState(0);
+  const smoothed = useRef(0);
+
+  useEffect(() => {
+    Magnetometer.setUpdateInterval(200);
+    const sub = Magnetometer.addListener(({ x, y }) => {
+      const angle = Math.atan2(y, x) * (180 / Math.PI);
+      // low-pass filter simples pra reduzir jitter
+      smoothed.current = smoothed.current * 0.85 + angle * 0.15;
+      setHeading(smoothed.current);
+    });
+    return () => sub.remove();
+  }, []);
+
+  return heading;
+}
+```
+
+---
+
+## 9. Backend (fora do escopo do RN, mas necessário)
+
+Não dá pra fazer esse app só com cliente + SFU gerenciado. Precisa de um serviço próprio pra:
+
+1. **Query geoespacial** — PostGIS (`ST_DWithin`) ou geohash/H3 pra "quem/o que está a X metros de mim"
+2. **WebSocket de presença** — recebe posição de cada cliente a cada 1-3s, rebroadcasta pra quem está no raio
+3. **Lock de coleta de itens** — endpoint transacional que evita duas pessoas coletando o mesmo item
+4. **Geração de token do Agora** — tokens de canal são gerados server-side (nunca no cliente, por segurança)
+
+Isso pode começar simples (Node + Postgres/PostGIS + `ws` ou Socket.io) e não precisa ser sofisticado no MVP — só precisa resolver essas 4 responsabilidades corretamente.
+
+---
+
+## 10. Ordem de implementação sugerida
+
+Construir tudo em paralelo é receita pra travar. Sequência que reduz risco:
+
+1. **Mapa + GPS sozinhos** — MapLibre renderizando, posição própria atualizando, sem áudio nem multiplayer ainda
+2. **Itens estáticos no mapa** — GeoJSON hardcoded, sem backend, valida a UX de visualização e coleta por proximidade
+3. **Backend geoespacial básico** — PostGIS + endpoint de "itens próximos" + WebSocket de posição própria (ainda sem outros usuários)
+4. **Multiplayer de posição** — outros usuários aparecendo no mapa em tempo real (sem áudio ainda)
+5. **Áudio espacial isolado** — dois devices, canal fixo, testando só o panning por distância (sem GPS ainda, posições mockadas)
+6. **Integração final** — GPS real alimentando o áudio espacial + raio de subscribe/unsubscribe dinâmico
+
+Cada etapa é testável isoladamente antes de somar complexidade.

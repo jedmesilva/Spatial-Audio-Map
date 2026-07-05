@@ -1,3 +1,3 @@
-- [Expo web bundle isolation](expo-web-bundle.md) — react-native-maps in app/ route files breaks web; keep it in src/screens/ platform-extension files only
+- [Mapa Espacial native-only](mapa-espacial-native-only.md) — app is native-only; single MapDisplay.tsx has react-native-maps; no platform extension split needed
 - [Orval zod codegen conflict](orval-zod-conflict.md) — removing schemas from zod config still regenerates index.ts with types export; fix manually after codegen
 - [Mapa Espacial WS collect rollback](mapa-espacial-ws.md) — WS socket needs intentional-close flag; collect_failed needs rollback via registerPendingCollect + worldStore.rollbackCollect
